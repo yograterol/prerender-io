@@ -27,6 +27,7 @@ const PURGE_MS      = 1000 * 60 * 60 * 24 * 60;  // 60 days
 const PAGE_TIMEOUT  = 25_000;
 const WORKER_COUNT  = 5;  // Number of concurrent workers
 const CLAIM_TIMEOUT = 60_000;  // Job claim timeout (1 minute)
+const CACHE_MAX_AGE_SEC = 60 * 60 * 24;          // 1 day client‑side TTL
 
 const MINIFY_OPTS = {
   collapseWhitespace: true,
