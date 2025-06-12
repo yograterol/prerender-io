@@ -76,6 +76,40 @@ const VIEWPORT = {
 /*────────────────────────── SQLite schema ─────────────────────*/
 const db = new Database("cache.sqlite", { create: true });
 
+// Performance-optimized pragma settings for caching workload
+db.exec(`
+  -- WAL mode for better concurrent read/write performance
+  PRAGMA journal_mode = WAL;
+  
+  -- Reduce fsync frequency (cache data can be regenerated if lost)
+  PRAGMA synchronous = NORMAL;
+  
+  -- Increase cache size to 64MB (adjust based on available RAM)
+  PRAGMA cache_size = -65536;
+  
+  -- Use memory for temporary operations
+  PRAGMA temp_store = MEMORY;
+  
+  -- Enable memory-mapped I/O for better performance (256MB)
+  PRAGMA mmap_size = 268435456;
+  
+  -- Set busy timeout to handle concurrent access (5 seconds)
+  PRAGMA busy_timeout = 5000;
+  
+  -- Enable foreign key constraints for data integrity
+  PRAGMA foreign_keys = ON;
+  
+  -- Auto-vacuum to manage database growth over time
+  PRAGMA auto_vacuum = INCREMENTAL;
+  
+  -- Optimize for bulk operations and reduce checkpointing frequency
+  PRAGMA wal_autocheckpoint = 10000;
+  
+  -- Analysis and optimization settings
+  PRAGMA optimize = 0x02;
+  PRAGMA analysis_limit = 1000;
+  `);
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS pages (
   url TEXT,
