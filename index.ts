@@ -25,7 +25,7 @@ const PORT          = 4000;
 const REFRESH_MS    = 1000 * 60 * 60 * 24 * 7;   // 7 days
 const PURGE_MS      = 1000 * 60 * 60 * 24 * 30;  // 30 days
 const PAGE_TIMEOUT  = 25_000;
-const WORKER_COUNT  = 3;  // Number of concurrent workers
+const WORKER_COUNT  = 5;  // Number of concurrent workers
 const CLAIM_TIMEOUT = 60_000;  // Job claim timeout (1 minute)
 
 const MINIFY_OPTS = {
@@ -494,7 +494,16 @@ async function sitemap(url) {
     if (url.endsWith('.gz')) buf = zlib.gunzipSync(buf);
     const xml = new XMLParser({ ignoreAttributes: false }).parse(buf.toString());
     const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at, priority, claimed_by, claimed_at) VALUES (?,?,?,0,NULL,NULL)");
-    const p   = u => ins.run(norm(u), 'desktop', Date.now());
+    
+    // Queue for all device types
+    const devices = ['desktop', 'mobile'];
+    const p = u => {
+      const normalizedUrl = norm(u);
+      devices.forEach(device => {
+        ins.run(normalizedUrl, device, Date.now());
+      });
+    };
+    
     if (xml.urlset?.url) xml.urlset.url.forEach(u => p(u.loc));
     if (xml.sitemapindex?.sitemap) for (const s of xml.sitemapindex.sitemap) await sitemap(s.loc);
   } catch {}
