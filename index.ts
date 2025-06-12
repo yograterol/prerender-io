@@ -1,10 +1,16 @@
 /*
-  Lightweight Prerender.io‑style server — v0.9 (device‑aware + JS‑free)
-  Bun + Puppeteer · Port 4000 · Author: ChatGPT
+  Lightweight Prerender.io-style server — v1.1 (device-aware + JS-free)
+  Bun + Puppeteer · Port 4000
   ──────────────────────────────────────────────────────────────────
-  Snapshot‑only output: fully rendered DOM + inlined same‑origin CSS.
-  ALL JavaScript is stripped: <script>, modulepreload links, inline
-  event‑handler attributes (onclick, onload …) and javascript: hrefs.
+  Snapshot-only output: fully rendered DOM + inlined same-origin CSS.
+  ALL JavaScript is stripped **after** the page finishes rendering.
+  Asset loading is allowed for any sub-domain of the requested domain
+  (e.g. static.example.com, img.cdn.example.com …).
+
+  v1.1 changes:
+  • Removed all console.log statements to keep stdout clean.
+  • Hardened iframe sanitisation: absolutely no <iframe> or sub-frame
+    network requests are allowed unless the host is explicitly whitelisted.
 */
 
 import { Database } from "bun:sqlite";
@@ -39,6 +45,12 @@ const BLOCKED_SCRIPT_PATTERNS = [
   /clarity\.ms/i,
 ];
 
+/*
+  Explicit iframe allow-list.  If empty (default), **all** iframe/sub-frame
+  requests are aborted.  Populate with hosts ("example.com") to permit them.
+*/
+const ALLOWED_IFRAME_HOSTS = [];
+
 /*──────────────────── Device detection ───────────────────────*/
 function deviceFromUA(ua = "") {
   const low = ua.toLowerCase();
@@ -50,9 +62,9 @@ function deviceFromUA(ua = "") {
 }
 
 const DEFAULT_UA = {
-  mobile:   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-  tablet:   "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-  desktop:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  mobile:   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) prerender headlesschrome AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  tablet:   "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) prerender headlesschrome AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+  desktop:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) prerender headlesschrome AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 };
 
 const VIEWPORT = {
@@ -127,6 +139,10 @@ const extractMaps = txt => txt.split(/\r?\n/).map(l => l.trim()).filter(l => /^s
 /*──────────────────────── Puppeteer pool ──────────────────────*/
 const BROWSER = puppeteer.launch({ headless: "new", args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
 
+function rootDomain(h) {
+  return h.split('.').slice(-2).join('.');
+}
+
 async function inlineCSS(page, origin) {
   await page.evaluate(async (origin) => {
     const links = Array.from(document.querySelectorAll('link[rel="stylesheet"][href]'));
@@ -169,33 +185,75 @@ async function render(full, dev, ua) {
   const browser = await BROWSER;
   const page    = await browser.newPage();
   const host    = new URL(full).host;
+  const root    = rootDomain(host);
 
   await page.setUserAgent(ua || DEFAULT_UA[dev]);
   await page.setViewport(VIEWPORT[dev]);
 
-  const FONT_OK = [host, "cdnjs.cloudflare.com", "cdn.materialdesignicons.com", "fonts.gstatic.com"];
+  const FONT_OK = [host, `fonts.gstatic.com`, `cdnjs.cloudflare.com`, `cdn.materialdesignicons.com`];
+
+  /*──── Request interception ────*/
   await page.setRequestInterception(true);
   page.on("request", req => {
-    if (req.frame() !== page.mainFrame()) return req.abort();
-    const t = req.resourceType();
-    if (t === "media") return req.abort();
-    if (t === "script") {
-      try { const u = new URL(req.url()); if (u.host !== host && BLOCKED_SCRIPT_PATTERNS.some(re => re.test(u.hostname + u.pathname))) return req.abort(); } catch {}
+    const type = req.resourceType();
+    const url  = req.url();
+
+    /* Absolutely block every iframe/sub-frame unless explicitly allowed */
+    if (type === "sub_frame") {
+      try {
+        const h = new URL(url).host;
+        if (!ALLOWED_IFRAME_HOSTS.includes(h)) return req.abort();
+      } catch { return req.abort(); }
     }
-    if (t === "font") { try { const h = new URL(req.url()).host; if (!FONT_OK.includes(h)) return req.abort(); } catch {} }
-    try { const h = new URL(req.url()).host; if (h !== host && !FONT_OK.includes(h)) return req.abort(); } catch {}
+
+    const sameSite = (() => {
+      try {
+        const h = new URL(url).host;
+        return h === host || h.endsWith(`.${host}`) || rootDomain(h) === root;
+      } catch { return false; }
+    })();
+
+    /* Block requests from frames that aren't the main frame */
+    if (req.frame() !== page.mainFrame()) return req.abort();
+
+    /* Block media to speed-up snapshot */
+    if (type === "media") return req.abort();
+
+    /* Block external object/embed elements */
+    if ((type === "other" || type === "object") && !sameSite) return req.abort();
+
+    /* Scripts: block external + known tracking patterns */
+    if (type === "script") {
+      if (!sameSite && BLOCKED_SCRIPT_PATTERNS.some(re => re.test(url))) return req.abort();
+      if (!sameSite) return req.abort(); // no external scripts at all
+    }
+
+    /* Fonts: only allow from trusted hosts */
+    if (type === "font" && !(sameSite || FONT_OK.includes(new URL(url).host))) return req.abort();
+
+    /* Block external stylesheets that might load external content */
+    if (type === "stylesheet" && !sameSite && !FONT_OK.includes(new URL(url).host)) return req.abort();
+
+    /* Otherwise allow */
     req.continue();
   });
 
   let status = 0;
-  try { status = (await page.goto(full, { waitUntil: "networkidle0", timeout: PAGE_TIMEOUT }))?.status() ?? 0; } catch {}
+  try {
+    status = (await page.goto(full, { waitUntil: "networkidle0", timeout: PAGE_TIMEOUT }))?.status() ?? 0;
+  } catch {}
+
   if (status === 200) {
+    /* Extra wait to let late JS mutations finish */
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    /* Scroll to the bottom so lazy-loaded images appear */
     await page.evaluate(async () => {
       window.scrollTo(0, document.body.scrollHeight);
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
     });
 
-    /* Fix lazy‑loaded media → absolute URLs */
+    /* Fix lazy-loaded media → absolute URLs */
     await page.evaluate(() => {
       const abs = (u) => /^(https?:)?\/\//i.test(u) || u.startsWith("data:") ? u : (u.startsWith("/") ? location.origin + u : location.origin + "/" + u);
       document.querySelectorAll('img[src], image[href], use[href], use[xlink\\:href], source[srcset]').forEach(el => {
@@ -207,7 +265,7 @@ async function render(full, dev, ua) {
     });
 
     await inlineCSS(page, `https://${host}`);
-    await sanitizeJS(page, host);
+    await sanitizeJS(page);  // strip JS only after everything rendered
   }
 
   const html = status === 200 ? await page.content() : null;
@@ -230,7 +288,9 @@ async function render(full, dev, ua) {
       const { html, status } = await render(`https://${r.url}`, r.device, DEFAULT_UA[r.device]);
       if (status === 404) db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(r.url, r.device, status, Date.now());
       save(r.url, r.device, html ? await minify(html, MINIFY_OPTS) : null, status || 0);
-    } catch (e) { console.error("Render error", r, e); }
+    } catch (e) {
+      console.error("Render error", r, e);
+    }
   }
 })();
 
@@ -273,10 +333,10 @@ Bun.serve({
       return new Response('Not Found', { status: 404 });
     }
 
-    /* Render */
+    /* Render endpoint */
     if (pathname === '/render') {
       const target = searchParams.get('url'); if (!target) return new Response('Missing url', { status: 400 });
-      const ua      = req.headers.get('user-agent') || '';
+      const ua      = req.headers.get('user-agent') + ' prerender' || '';
       const device  = deviceFromUA(ua);
       const urlKey  = norm(target);
       if (!allowed(urlKey.split('/')[0])) return new Response('Domain not allowed', { status: 403 });
@@ -298,8 +358,6 @@ Bun.serve({
     return new Response('Not Found', { status: 404 });
   }
 });
-
-console.log(`🚀 Prerender v0.9 (device‑aware, JS‑free) listening on :${PORT}`);
 
 /*──────────── Boot ───────────*/
 for (const { domain } of db.query('SELECT domain FROM domains WHERE active = 1').all()) robots(domain);
