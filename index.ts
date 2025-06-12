@@ -22,8 +22,8 @@ import { XMLParser } from "fast-xml-parser";
 
 /*──────────────────────────── Config ───────────────────────────*/
 const PORT          = 4000;
-const REFRESH_MS    = 1000 * 60 * 60 * 24 * 7;   // 7 days
-const PURGE_MS      = 1000 * 60 * 60 * 24 * 30;  // 30 days
+const REFRESH_MS    = 1000 * 60 * 60 * 24 * 14;   // 14 days
+const PURGE_MS      = 1000 * 60 * 60 * 24 * 60;  // 60 days
 const PAGE_TIMEOUT  = 25_000;
 const WORKER_COUNT  = 5;  // Number of concurrent workers
 const CLAIM_TIMEOUT = 60_000;  // Job claim timeout (1 minute)
