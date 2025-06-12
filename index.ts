@@ -1,16 +1,18 @@
 /*
-  Lightweight Prerender.io-style server — v1.1 (device-aware + JS-free)
+  Lightweight Prerender.io‑style server — v1.2 (device‑aware + JS‑free)
   Bun + Puppeteer · Port 4000
   ──────────────────────────────────────────────────────────────────
-  Snapshot-only output: fully rendered DOM + inlined same-origin CSS.
+  Snapshot‑only output: fully rendered DOM + inlined same‑origin CSS.
   ALL JavaScript is stripped **after** the page finishes rendering.
-  Asset loading is allowed for any sub-domain of the requested domain
+  Asset loading is allowed for any sub‑domain of the requested domain
   (e.g. static.example.com, img.cdn.example.com …).
 
-  v1.1 changes:
-  • Removed all console.log statements to keep stdout clean.
-  • Hardened iframe sanitisation: absolutely no <iframe> or sub-frame
-    network requests are allowed unless the host is explicitly whitelisted.
+  v1.2 changes (2025‑06‑12):
+  • /render now queues first‑time URLs with high priority and waits for the
+    worker, instead of spawning its own Puppeteer instance.
+  • Queue table gains a `priority` column (0 = background, 1 = urgent).
+  • Worker drains urgent jobs before normal ones.
+  • Helper `push()` accepts an `urgent` flag.
 */
 
 import { Database } from "bun:sqlite";
@@ -46,7 +48,7 @@ const BLOCKED_SCRIPT_PATTERNS = [
 ];
 
 /*
-  Explicit iframe allow-list.  If empty (default), **all** iframe/sub-frame
+  Explicit iframe allow‑list.  If empty (default), **all** iframe/sub‑frame
   requests are aborted.  Populate with hosts ("example.com") to permit them.
 */
 const ALLOWED_IFRAME_HOSTS = [];
@@ -76,40 +78,24 @@ const VIEWPORT = {
 /*────────────────────────── SQLite schema ─────────────────────*/
 const db = new Database("cache.sqlite", { create: true });
 
-// Performance-optimized pragma settings for caching workload
+// Performance‑optimized pragma settings for caching workload
+// (unchanged from v1.1)
 db.exec(`
-  -- WAL mode for better concurrent read/write performance
   PRAGMA journal_mode = WAL;
-  
-  -- Reduce fsync frequency (cache data can be regenerated if lost)
   PRAGMA synchronous = NORMAL;
-  
-  -- Increase cache size to 64MB (adjust based on available RAM)
-  PRAGMA cache_size = -65536;
-  
-  -- Use memory for temporary operations
+  PRAGMA cache_size = -65536;          -- 64 MB
   PRAGMA temp_store = MEMORY;
-  
-  -- Enable memory-mapped I/O for better performance (256MB)
-  PRAGMA mmap_size = 268435456;
-  
-  -- Set busy timeout to handle concurrent access (5 seconds)
+  PRAGMA mmap_size = 268435456;        -- 256 MB
   PRAGMA busy_timeout = 5000;
-  
-  -- Enable foreign key constraints for data integrity
   PRAGMA foreign_keys = ON;
-  
-  -- Auto-vacuum to manage database growth over time
   PRAGMA auto_vacuum = INCREMENTAL;
-  
-  -- Optimize for bulk operations and reduce checkpointing frequency
   PRAGMA wal_autocheckpoint = 10000;
-  
-  -- Analysis and optimization settings
   PRAGMA optimize = 0x02;
   PRAGMA analysis_limit = 1000;
-  `);
+`);
 
+// Main tables
+// – queue now has PRIORITY (0|1) and an index on (priority,enqueued_at)
 db.exec(`
 CREATE TABLE IF NOT EXISTS pages (
   url TEXT,
@@ -119,16 +105,20 @@ CREATE TABLE IF NOT EXISTS pages (
   fetched_at INTEGER NOT NULL,
   PRIMARY KEY (url, device)
 );
+
 CREATE TABLE IF NOT EXISTS domains (
   domain TEXT PRIMARY KEY,
   active INTEGER NOT NULL DEFAULT 1
 );
+
 CREATE TABLE IF NOT EXISTS queue (
   url TEXT,
   device TEXT,
   enqueued_at INTEGER NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,  -- 0 = background, 1 = urgent
   PRIMARY KEY (url, device)
 );
+
 CREATE TABLE IF NOT EXISTS errors (
   url TEXT,
   device TEXT,
@@ -137,12 +127,12 @@ CREATE TABLE IF NOT EXISTS errors (
   PRIMARY KEY (url, device)
 );
 
--- Performance indexes
-CREATE INDEX IF NOT EXISTS idx_pages_url ON pages(url);
-CREATE INDEX IF NOT EXISTS idx_pages_fetched_at ON pages(fetched_at);
-CREATE INDEX IF NOT EXISTS idx_queue_enqueued_at ON queue(enqueued_at);
-CREATE INDEX IF NOT EXISTS idx_errors_first_hit ON errors(first_hit);
-CREATE INDEX IF NOT EXISTS idx_domains_active ON domains(active);
+/*──────── Indexes ────────*/
+CREATE INDEX IF NOT EXISTS idx_pages_url          ON pages(url);
+CREATE INDEX IF NOT EXISTS idx_pages_fetched_at   ON pages(fetched_at);
+CREATE INDEX IF NOT EXISTS idx_queue_priority     ON queue(priority, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_errors_first_hit   ON errors(first_hit);
+CREATE INDEX IF NOT EXISTS idx_domains_active     ON domains(active);
 `);
 
 /*────────────────────────── Helpers ───────────────────────────*/
@@ -163,8 +153,9 @@ function save(url, dev, html, status = 200) {
 function get(url, dev) {
   return db.query("SELECT html, status, fetched_at FROM pages WHERE url = ? AND device = ?").get(url, dev) || null;
 }
-function push(url, dev) {
-  db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at) VALUES (?,?,?)").run(url, dev, Date.now());
+function push(url, dev, urgent = false) {
+  db.query("INSERT OR REPLACE INTO queue (url, device, enqueued_at, priority) VALUES (?,?,?,?)")
+    .run(url, dev, Date.now(), urgent ? 1 : 0);
 }
 
 /* robots.txt sitemap extractor */
@@ -232,7 +223,7 @@ async function render(full, dev, ua) {
     const type = req.resourceType();
     const url  = req.url();
 
-    /* Absolutely block every iframe/sub-frame unless explicitly allowed */
+    /* Absolutely block every iframe/sub‑frame unless explicitly allowed */
     if (type === "sub_frame") {
       try {
         const h = new URL(url).host;
@@ -250,7 +241,7 @@ async function render(full, dev, ua) {
     /* Block requests from frames that aren't the main frame */
     if (req.frame() !== page.mainFrame()) return req.abort();
 
-    /* Block media to speed-up snapshot */
+    /* Block media to speed‑up snapshot */
     if (type === "media") return req.abort();
 
     /* Block external object/embed elements */
@@ -281,13 +272,13 @@ async function render(full, dev, ua) {
     /* Extra wait to let late JS mutations finish */
     await new Promise(resolve => setTimeout(resolve, 1000));
 
-    /* Scroll to the bottom so lazy-loaded images appear */
+    /* Scroll to the bottom so lazy‑loaded images appear */
     await page.evaluate(async () => {
       window.scrollTo(0, document.body.scrollHeight);
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
     });
 
-    /* Fix lazy-loaded media → absolute URLs */
+    /* Fix lazy‑loaded media → absolute URLs */
     await page.evaluate(() => {
       const abs = (u) => /^(https?:)?\/\//i.test(u) || u.startsWith("data:") ? u : (u.startsWith("/") ? location.origin + u : location.origin + "/" + u);
       document.querySelectorAll('img[src], image[href], use[href], use[xlink\\:href], source[srcset]').forEach(el => {
@@ -309,15 +300,20 @@ async function render(full, dev, ua) {
 
 /*────────────────────── Queue worker ─────────────────────────*/
 (async function worker() {
-  const next = db.query("SELECT url, device FROM queue ORDER BY enqueued_at ASC LIMIT 1");
+  const next = db.query("SELECT url, device FROM queue ORDER BY priority DESC, enqueued_at ASC LIMIT 1");
   const del  = db.query("DELETE FROM queue WHERE url = ? AND device = ?");
+
   while (true) {
     const r = next.get();
     if (!r) { await Bun.sleep(1000); continue; }
+
     del.run(r.url, r.device);
+
     if (!allowed(r.url.split('/')[0])) continue;
+
     const snap = get(r.url, r.device);
     if (snap && Date.now() - snap.fetched_at < PURGE_MS) continue;
+
     try {
       const { html, status } = await render(`https://${r.url}`, r.device, DEFAULT_UA[r.device]);
       if (status === 404) db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(r.url, r.device, status, Date.now());
@@ -338,7 +334,7 @@ async function sitemap(url) {
     let buf = Buffer.from(await res.arrayBuffer());
     if (url.endsWith('.gz')) buf = zlib.gunzipSync(buf);
     const xml = new XMLParser({ ignoreAttributes: false }).parse(buf.toString());
-    const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at) VALUES (?,?,?)");
+    const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at, priority) VALUES (?,?,?,0)");
     const p   = u => ins.run(norm(u), 'desktop', Date.now());
     if (xml.urlset?.url) xml.urlset.url.forEach(u => p(u.loc));
     if (xml.sitemapindex?.sitemap) for (const s of xml.sitemapindex.sitemap) await sitemap(s.loc);
@@ -370,23 +366,57 @@ Bun.serve({
     /* Render endpoint */
     if (pathname === '/render') {
       const target = searchParams.get('url'); if (!target) return new Response('Missing url', { status: 400 });
-      const ua      = req.headers.get('user-agent') + ' prerender' || '';
+      const ua      = (req.headers.get('user-agent') || '') + ' prerender';
       const device  = deviceFromUA(ua);
       const urlKey  = norm(target);
+
       if (!allowed(urlKey.split('/')[0])) return new Response('Domain not allowed', { status: 403 });
 
-      const err = db.query('SELECT status FROM errors WHERE url = ? AND device = ?').get(urlKey, device); if (err) return new Response('Not found', { status: err.status, headers: { 'X-Prerender-Cache': '404' } });
-      const snap = get(urlKey, device);
+      const err = db.query('SELECT status FROM errors WHERE url = ? AND device = ?').get(urlKey, device);
+      if (err) return new Response('Not found', { status: err.status, headers: { 'X-Prerender-Cache': '404' }});
+
+      // 1️⃣ Check cache first
+      let snap = get(urlKey, device);
       if (snap) {
-        if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device);
-        return new Response(snap.html ?? '', { status: snap.status || 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Prerender-Cache': 'HIT' } });
+        if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device); // soft refresh in background
+        return new Response(snap.html ?? '', {
+          status: snap.status || 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'X-Prerender-Cache': 'HIT'
+          }
+        });
       }
 
-      const { html, status } = await render(`https://${urlKey}`, device, ua);
-      const min = html ? await minify(html, MINIFY_OPTS) : null;
-      if (status === 404) db.query('INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)').run(urlKey, device, status, Date.now());
-      save(urlKey, device, min, status || 0);
-      return new Response(min ?? '', { status: status || 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Prerender-Cache': 'MISS' } });
+      // 2️⃣ Not cached → enqueue with high priority
+      push(urlKey, device, true);
+
+      // 3️⃣ Give worker a window to process (max = PAGE_TIMEOUT + 3 s)
+      const DEADLINE = Date.now() + PAGE_TIMEOUT + 3_000;
+      while (Date.now() < DEADLINE) {
+        await Bun.sleep(250);
+        snap = get(urlKey, device);
+        if (snap) break;
+      }
+
+      if (snap) {
+        return new Response(snap.html ?? '', {
+          status: snap.status || 200,
+          headers: {
+            'Content-Type': 'text/html; charset=utf-8',
+            'X-Prerender-Cache': 'MISS-WAIT'
+          }
+        });
+      }
+
+      // 4️⃣ Still not done → tell client to retry soon
+      return new Response('Rendering in progress', {
+        status: 202,
+        headers: {
+          'Retry-After': '15',
+          'X-Prerender-Cache': 'QUEUED'
+        }
+      });
     }
 
     return new Response('Not Found', { status: 404 });
