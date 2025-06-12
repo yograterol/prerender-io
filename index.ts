@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS errors (
   first_hit INTEGER NOT NULL,
   PRIMARY KEY (url, device)
 );
+
+-- Performance indexes
+CREATE INDEX IF NOT EXISTS idx_pages_url ON pages(url);
+CREATE INDEX IF NOT EXISTS idx_pages_fetched_at ON pages(fetched_at);
+CREATE INDEX IF NOT EXISTS idx_queue_enqueued_at ON queue(enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_errors_first_hit ON errors(first_hit);
+CREATE INDEX IF NOT EXISTS idx_domains_active ON domains(active);
 `);
 
 /*────────────────────────── Helpers ───────────────────────────*/
@@ -210,7 +217,7 @@ async function render(full, dev, ua) {
 
 /*────────────────────── Queue worker ─────────────────────────*/
 (async function worker() {
-  const next = db.query("SELECT url, device FROM queue LIMIT 1");
+  const next = db.query("SELECT url, device FROM queue ORDER BY enqueued_at ASC LIMIT 1");
   const del  = db.query("DELETE FROM queue WHERE url = ? AND device = ?");
   while (true) {
     const r = next.get();
