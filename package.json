@@ -1,0 +1,18 @@
+{
+  "name": "prerender-open",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.2.5",
+    "html-minifier-terser": "^7.2.0",
+    "puppeteer": "^24.10.0",
+    "robots-txt-parse": "^2.0.1"
+  }
+}
