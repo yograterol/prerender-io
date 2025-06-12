@@ -1,5 +1,5 @@
 /*
-  Lightweight Prerender.io‑style server — v1.2 (device‑aware + JS‑free)
+  Lightweight Prerender.io‑style server — v1.3 (Multi-worker + device‑aware + JS‑free)
   Bun + Puppeteer · Port 4000
   ──────────────────────────────────────────────────────────────────
   Snapshot‑only output: fully rendered DOM + inlined same‑origin CSS.
@@ -7,13 +7,11 @@
   Asset loading is allowed for any sub‑domain of the requested domain
   (e.g. static.example.com, img.cdn.example.com …).
 
-  v1.2 changes (2025‑06‑12):
-  • /render now queues first‑time URLs with high priority and waits for the
-    worker, instead of spawning its own Puppeteer instance.
-  • Queue table gains a `priority` column (0 = background, 1 = urgent).
-  • Worker drains urgent jobs before normal ones.
-  • Helper `push()` accepts an `urgent` flag.
-  • FIXED: Avoid caching empty HTML, requeue and remove bad entries
+  v1.3 changes (2025‑06‑12):
+  • Multiple concurrent workers with atomic job claiming
+  • Worker crash recovery with timeout mechanism
+  • Separate browser instances per worker to avoid conflicts
+  • Worker ID tracking and heartbeat system
 */
 
 import { Database } from "bun:sqlite";
@@ -27,6 +25,8 @@ const PORT          = 4000;
 const REFRESH_MS    = 1000 * 60 * 60 * 24 * 7;   // 7 days
 const PURGE_MS      = 1000 * 60 * 60 * 24 * 30;  // 30 days
 const PAGE_TIMEOUT  = 25_000;
+const WORKER_COUNT  = 3;  // Number of concurrent workers
+const CLAIM_TIMEOUT = 60_000;  // Job claim timeout (1 minute)
 
 const MINIFY_OPTS = {
   collapseWhitespace: true,
@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS queue (
   device TEXT,
   enqueued_at INTEGER NOT NULL,
   priority INTEGER NOT NULL DEFAULT 0,  -- 0 = background, 1 = urgent
+  claimed_by TEXT NULL,                  -- worker ID that claimed this job
+  claimed_at INTEGER NULL,               -- when job was claimed
   PRIMARY KEY (url, device)
 );
 
@@ -126,12 +128,20 @@ CREATE TABLE IF NOT EXISTS errors (
   PRIMARY KEY (url, device)
 );
 
+CREATE TABLE IF NOT EXISTS workers (
+  worker_id TEXT PRIMARY KEY,
+  last_heartbeat INTEGER NOT NULL,
+  started_at INTEGER NOT NULL
+);
+
 /*──────── Indexes ────────*/
 CREATE INDEX IF NOT EXISTS idx_pages_url          ON pages(url);
 CREATE INDEX IF NOT EXISTS idx_pages_fetched_at   ON pages(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_queue_priority     ON queue(priority, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_queue_claimed      ON queue(claimed_by, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_errors_first_hit   ON errors(first_hit);
 CREATE INDEX IF NOT EXISTS idx_domains_active     ON domains(active);
+CREATE INDEX IF NOT EXISTS idx_workers_heartbeat  ON workers(last_heartbeat);
 `);
 
 /*────────────────────────── Helpers ───────────────────────────*/
@@ -157,11 +167,11 @@ function get(url, dev) {
 }
 
 function push(url, dev, urgent = false) {
-  db.query("INSERT OR REPLACE INTO queue (url, device, enqueued_at, priority) VALUES (?,?,?,?)")
+  db.query("INSERT OR REPLACE INTO queue (url, device, enqueued_at, priority, claimed_by, claimed_at) VALUES (?,?,?,?,NULL,NULL)")
     .run(url, dev, Date.now(), urgent ? 1 : 0);
 }
 
-// NEW: Helper to check if HTML content is valid (not empty/null)
+// Helper to check if HTML content is valid (not empty/null)
 function isValidHTML(html) {
   if (!html || typeof html !== 'string') return false;
   const trimmed = html.trim();
@@ -170,19 +180,76 @@ function isValidHTML(html) {
   return trimmed.length > 50 && (trimmed.includes('<html') || trimmed.includes('<body') || trimmed.includes('<!DOCTYPE'));
 }
 
-// NEW: Remove invalid cache entry
+// Remove invalid cache entry
 function removeFromCache(url, dev) {
   db.query("DELETE FROM pages WHERE url = ? AND device = ?").run(url, dev);
+}
+
+// Worker management functions
+function registerWorker(workerId) {
+  const now = Date.now();
+  db.query("INSERT OR REPLACE INTO workers (worker_id, last_heartbeat, started_at) VALUES (?,?,?)")
+    .run(workerId, now, now);
+}
+
+function updateWorkerHeartbeat(workerId) {
+  db.query("UPDATE workers SET last_heartbeat = ? WHERE worker_id = ?")
+    .run(Date.now(), workerId);
+}
+
+// Atomically claim a job from the queue
+function claimJob(workerId) {
+  const now = Date.now();
+  const timeoutThreshold = now - CLAIM_TIMEOUT;
+  
+  // First, release any stale claims
+  db.query("UPDATE queue SET claimed_by = NULL, claimed_at = NULL WHERE claimed_at < ?")
+    .run(timeoutThreshold);
+  
+  // Try to claim the highest priority unclaimed job
+  const job = db.query(`
+    SELECT url, device FROM queue 
+    WHERE claimed_by IS NULL 
+    ORDER BY priority DESC, enqueued_at ASC 
+    LIMIT 1
+  `).get();
+  
+  if (!job) return null;
+  
+  // Atomically claim the job
+  const result = db.query(`
+    UPDATE queue 
+    SET claimed_by = ?, claimed_at = ? 
+    WHERE url = ? AND device = ? AND claimed_by IS NULL
+  `).run(workerId, now, job.url, job.device);
+  
+  // If we successfully claimed it, return the job
+  if (result.changes > 0) {
+    return job;
+  }
+  
+  return null; // Someone else claimed it first
+}
+
+// Remove job from queue after completion
+function completeJob(workerId, url, device) {
+  db.query("DELETE FROM queue WHERE url = ? AND device = ? AND claimed_by = ?")
+    .run(url, device, workerId);
 }
 
 /* robots.txt sitemap extractor */
 const extractMaps = txt => txt.split(/\r?\n/).map(l => l.trim()).filter(l => /^sitemap:/i.test(l)).map(l => l.split(/\s+/)[1]).filter(Boolean);
 
-/*──────────────────────── Puppeteer pool ──────────────────────*/
-const BROWSER = puppeteer.launch({ headless: "new", args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
-
+/*──────────────────────── Puppeteer rendering ────────────────*/
 function rootDomain(h) {
   return h.split('.').slice(-2).join('.');
+}
+
+async function createBrowser() {
+  return await puppeteer.launch({ 
+    headless: "new", 
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] 
+  });
 }
 
 async function inlineCSS(page, origin) {
@@ -223,11 +290,10 @@ async function sanitizeJS(page) {
   });
 }
 
-async function render(full, dev, ua) {
-  const browser = await BROWSER;
-  const page    = await browser.newPage();
-  const host    = new URL(full).host;
-  const root    = rootDomain(host);
+async function render(browser, full, dev, ua) {
+  const page = await browser.newPage();
+  const host = new URL(full).host;
+  const root = rootDomain(host);
 
   await page.setUserAgent(ua || DEFAULT_UA[dev]);
   await page.setViewport(VIEWPORT[dev]);
@@ -316,61 +382,106 @@ async function render(full, dev, ua) {
 }
 
 /*────────────────────── Queue worker ─────────────────────────*/
-(async function worker() {
-  const next = db.query("SELECT url, device FROM queue ORDER BY priority DESC, enqueued_at ASC LIMIT 1");
-  const del  = db.query("DELETE FROM queue WHERE url = ? AND device = ?");
+async function createWorker(workerId) {
+  registerWorker(workerId);
+  const browser = await createBrowser();
+  
+  console.log(`🔧 Worker ${workerId} started with dedicated browser`);
 
-  while (true) {
-    const r = next.get();
-    if (!r) { await Bun.sleep(1000); continue; }
+  // Heartbeat interval
+  const heartbeatInterval = setInterval(() => {
+    updateWorkerHeartbeat(workerId);
+  }, 10000); // Update every 10 seconds
 
-    del.run(r.url, r.device);
+  async function workerLoop() {
+    while (true) {
+      try {
+        const job = claimJob(workerId);
+        if (!job) {
+          await Bun.sleep(1000);
+          continue;
+        }
 
-    if (!allowed(r.url.split('/')[0])) continue;
+        console.log(`🔧 Worker ${workerId} processing: ${job.url} (${job.device})`);
 
-    const snap = get(r.url, r.device);
-    if (snap && Date.now() - snap.fetched_at < PURGE_MS) continue;
+        if (!allowed(job.url.split('/')[0])) {
+          completeJob(workerId, job.url, job.device);
+          continue;
+        }
 
-    try {
-      const { html, status } = await render(`https://${r.url}`, r.device, DEFAULT_UA[r.device]);
-      
-      // Handle different scenarios
-      if (status === 404) {
-        // Store 404 errors in errors table
-        db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(r.url, r.device, status, Date.now());
-      } else if (status === 200 && html) {
-        // Try to minify the HTML
-        let minifiedHtml;
+        const snap = get(job.url, job.device);
+        if (snap && Date.now() - snap.fetched_at < PURGE_MS) {
+          completeJob(workerId, job.url, job.device);
+          continue;
+        }
+
         try {
-          minifiedHtml = await minify(html, MINIFY_OPTS);
-        } catch (minifyError) {
-          console.warn("Minification failed for", r.url, minifyError);
-          minifiedHtml = html; // Fall back to unminified HTML
+          const { html, status } = await render(browser, `https://${job.url}`, job.device, DEFAULT_UA[job.device]);
+          
+          // Handle different scenarios
+          if (status === 404) {
+            // Store 404 errors in errors table
+            db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(job.url, job.device, status, Date.now());
+          } else if (status === 200 && html) {
+            // Try to minify the HTML
+            let minifiedHtml;
+            try {
+              minifiedHtml = await minify(html, MINIFY_OPTS);
+            } catch (minifyError) {
+              console.warn(`⚠️  Worker ${workerId}: Minification failed for ${job.url}`, minifyError);
+              minifiedHtml = html; // Fall back to unminified HTML
+            }
+            
+            // Only cache if HTML is valid and not empty
+            if (isValidHTML(minifiedHtml)) {
+              save(job.url, job.device, minifiedHtml, status);
+              console.log(`✅ Worker ${workerId}: Cached ${job.url} (${job.device})`);
+            } else {
+              console.warn(`⚠️  Worker ${workerId}: Invalid/empty HTML for ${job.url} - not caching, will retry`);
+              // Remove any existing invalid cache entry
+              removeFromCache(job.url, job.device);
+              // Requeue for retry (but not as urgent to avoid infinite loops)
+              push(job.url, job.device, false);
+            }
+          } else {
+            // Non-200 status (except 404) - don't cache, but also remove any existing cache
+            console.warn(`⚠️  Worker ${workerId}: Non-200 status ${status} for ${job.url} - removing from cache`);
+            removeFromCache(job.url, job.device);
+          }
+        } catch (e) {
+          console.error(`❌ Worker ${workerId}: Render error for ${job.url}`, e);
+          // On render error, remove any existing cache entry
+          removeFromCache(job.url, job.device);
         }
+
+        completeJob(workerId, job.url, job.device);
         
-        // FIXED: Only cache if HTML is valid and not empty
-        if (isValidHTML(minifiedHtml)) {
-          save(r.url, r.device, minifiedHtml, status);
-        } else {
-          console.warn("Invalid/empty HTML detected for", r.url, "- not caching, will retry");
-          // Remove any existing invalid cache entry
-          removeFromCache(r.url, r.device);
-          // Requeue for retry (but not as urgent to avoid infinite loops)
-          push(r.url, r.device, false);
-        }
-      } else {
-        // Non-200 status (except 404) - don't cache, but also remove any existing cache
-        console.warn("Non-200 status", status, "for", r.url, "- removing from cache");
-        removeFromCache(r.url, r.device);
-        // Could implement retry logic here with exponential backoff
+      } catch (e) {
+        console.error(`❌ Worker ${workerId}: Unexpected error`, e);
+        await Bun.sleep(5000); // Wait before retrying
       }
-    } catch (e) {
-      console.error("Render error", r, e);
-      // On render error, remove any existing cache entry and potentially requeue
-      removeFromCache(r.url, r.device);
     }
   }
-})();
+
+  // Handle cleanup on process exit
+  process.on('SIGINT', async () => {
+    clearInterval(heartbeatInterval);
+    await browser.close();
+    console.log(`🔧 Worker ${workerId} shut down gracefully`);
+  });
+
+  return workerLoop();
+}
+
+// Start multiple workers
+async function startWorkers() {
+  const workers = [];
+  for (let i = 1; i <= WORKER_COUNT; i++) {
+    const workerId = `worker-${i}-${Date.now()}`;
+    workers.push(createWorker(workerId));
+  }
+  await Promise.all(workers);
+}
 
 /*────────────── robots.txt & sitemap ingestion ───────────────*/
 async function robots(host) {
@@ -382,7 +493,7 @@ async function sitemap(url) {
     let buf = Buffer.from(await res.arrayBuffer());
     if (url.endsWith('.gz')) buf = zlib.gunzipSync(buf);
     const xml = new XMLParser({ ignoreAttributes: false }).parse(buf.toString());
-    const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at, priority) VALUES (?,?,?,0)");
+    const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at, priority, claimed_by, claimed_at) VALUES (?,?,?,0,NULL,NULL)");
     const p   = u => ins.run(norm(u), 'desktop', Date.now());
     if (xml.urlset?.url) xml.urlset.url.forEach(u => p(u.loc));
     if (xml.sitemapindex?.sitemap) for (const s of xml.sitemapindex.sitemap) await sitemap(s.loc);
@@ -411,12 +522,23 @@ Bun.serve({
         db.exec('DELETE FROM pages; DELETE FROM errors;'); 
         return new Response('cache cleared'); 
       }
-      // NEW: Admin endpoint to clean empty cache entries
+      if (pathname === '/admin/workers') {
+        const workers = db.query('SELECT worker_id, last_heartbeat, started_at FROM workers ORDER BY last_heartbeat DESC').all();
+        const now = Date.now();
+        return Response.json(workers.map(w => ({
+          ...w,
+          alive: (now - w.last_heartbeat) < 30000, // Consider alive if heartbeat within 30s
+          uptime: now - w.started_at
+        })));
+      }
+      if (pathname === '/admin/queue') {
+        const queue = db.query('SELECT url, device, priority, claimed_by, claimed_at, enqueued_at FROM queue ORDER BY priority DESC, enqueued_at ASC LIMIT 50').all();
+        return Response.json(queue);
+      }
       if (pathname === '/admin/clean-empty') {
         const emptyEntries = db.query("SELECT url, device FROM pages WHERE html IS NULL OR html = '' OR LENGTH(TRIM(html)) < 50").all();
         for (const entry of emptyEntries) {
           removeFromCache(entry.url, entry.device);
-          // Optionally requeue for retry
           push(entry.url, entry.device, false);
         }
         return new Response(`Cleaned ${emptyEntries.length} empty cache entries`);
@@ -443,7 +565,7 @@ Bun.serve({
       // 1️⃣ Check cache first
       let snap = get(urlKey, device);
       if (snap) {
-        // FIXED: Check if cached HTML is valid, if not, treat as cache miss
+        // Check if cached HTML is valid, if not, treat as cache miss
         if (!isValidHTML(snap.html)) {
           console.warn("Invalid HTML in cache for", urlKey, "- removing and retrying");
           removeFromCache(urlKey, device);
@@ -464,7 +586,7 @@ Bun.serve({
       // 2️⃣ Not cached (or invalid cache) → enqueue with high priority
       push(urlKey, device, true);
 
-      // 3️⃣ Give worker a window to process (max = PAGE_TIMEOUT + 10 s)
+      // 3️⃣ Give workers a window to process (max = PAGE_TIMEOUT + 10 s)
       const DEADLINE = Date.now() + PAGE_TIMEOUT + 10_000;
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
@@ -497,6 +619,13 @@ Bun.serve({
 });
 
 /*──────────── Boot ───────────*/
+// Clean up any stale worker registrations on startup
+db.exec('DELETE FROM workers WHERE last_heartbeat < ?', Date.now() - 60000);
+
+// Load domains and start robots crawling
 for (const { domain } of db.query('SELECT domain FROM domains WHERE active = 1').all()) robots(domain);
 
-console.log(`🚀 Prerender server running on port ${PORT}`);
+console.log(`🚀 Prerender server running on port ${PORT} with ${WORKER_COUNT} workers`);
+
+// Start the workers
+startWorkers().catch(console.error);
