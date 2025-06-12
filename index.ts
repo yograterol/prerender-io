@@ -511,6 +511,7 @@ async function sitemap(url) {
 
 /*──────────────────────── HTTP server ─────────────────────────*/
 Bun.serve({
+  idleTimeout: 35,
   port: PORT,
   async fetch(req) {
     const { pathname, searchParams } = new URL(req.url);
