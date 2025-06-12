@@ -427,9 +427,13 @@ Bun.serve({
     /* Render endpoint */
     if (pathname === '/render') {
       const target = searchParams.get('url'); if (!target) return new Response('Missing url', { status: 400 });
-      const ua      = (req.headers.get('user-agent') || '') + ' prerender';
+      const originalUA = req.headers.get('user-agent') || '';
+      const ua      = originalUA + ' prerender';
       const device  = deviceFromUA(ua);
       const urlKey  = norm(target);
+
+      // Log the user agent information
+      console.log(`[RENDER] ${new Date().toISOString()} | URL: ${target} | User-Agent: "${originalUA}" | Device: ${device}`);
 
       if (!allowed(urlKey.split('/')[0])) return new Response('Domain not allowed', { status: 403 });
 
@@ -460,8 +464,8 @@ Bun.serve({
       // 2️⃣ Not cached (or invalid cache) → enqueue with high priority
       push(urlKey, device, true);
 
-      // 3️⃣ Give worker a window to process (max = PAGE_TIMEOUT + 3 s)
-      const DEADLINE = Date.now() + PAGE_TIMEOUT + 3_000;
+      // 3️⃣ Give worker a window to process (max = PAGE_TIMEOUT + 10 s)
+      const DEADLINE = Date.now() + PAGE_TIMEOUT + 10_000;
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
@@ -478,12 +482,12 @@ Bun.serve({
         });
       }
 
-      // 4️⃣ Still not done → tell client to retry soon
-      return new Response('Rendering in progress', {
-        status: 202,
+      // 4️⃣ If still not ready after extended wait, return a generic error
+      console.warn(`[RENDER] Timeout waiting for ${urlKey} (${device}) - rendering took too long`);
+      return new Response('Service temporarily unavailable', {
+        status: 503,
         headers: {
-          'Retry-After': '15',
-          'X-Prerender-Cache': 'QUEUED'
+          'X-Prerender-Cache': 'TIMEOUT'
         }
       });
     }
