@@ -13,6 +13,7 @@
   • Queue table gains a `priority` column (0 = background, 1 = urgent).
   • Worker drains urgent jobs before normal ones.
   • Helper `push()` accepts an `urgent` flag.
+  • FIXED: Avoid caching empty HTML, requeue and remove bad entries
 */
 
 import { Database } from "bun:sqlite";
@@ -79,13 +80,12 @@ const VIEWPORT = {
 const db = new Database("cache.sqlite", { create: true });
 
 // Performance‑optimized pragma settings for caching workload
-// (unchanged from v1.1)
 db.exec(`
   PRAGMA journal_mode = WAL;
   PRAGMA synchronous = NORMAL;
-  PRAGMA cache_size = -65536;          -- 64 MB
+  PRAGMA cache_size = -65536;          -- 64 MB
   PRAGMA temp_store = MEMORY;
-  PRAGMA mmap_size = 268435456;        -- 256 MB
+  PRAGMA mmap_size = 268435456;        -- 256 MB
   PRAGMA busy_timeout = 5000;
   PRAGMA foreign_keys = ON;
   PRAGMA auto_vacuum = INCREMENTAL;
@@ -95,7 +95,6 @@ db.exec(`
 `);
 
 // Main tables
-// – queue now has PRIORITY (0|1) and an index on (priority,enqueued_at)
 db.exec(`
 CREATE TABLE IF NOT EXISTS pages (
   url TEXT,
@@ -142,20 +141,38 @@ function norm(raw) {
   const path = u.pathname.endsWith("/") && u.pathname !== "/" ? u.pathname.slice(0, -1) : u.pathname;
   return `${u.host}${path}`;
 }
+
 function allowed(host) {
   const r = db.query("SELECT active FROM domains WHERE domain = ?").get(host);
   return !!r?.active;
 }
+
 function save(url, dev, html, status = 200) {
   db.query("INSERT OR REPLACE INTO pages (url, device, html, status, fetched_at) VALUES (?,?,?,?,?)")
     .run(url, dev, html, status, Date.now());
 }
+
 function get(url, dev) {
   return db.query("SELECT html, status, fetched_at FROM pages WHERE url = ? AND device = ?").get(url, dev) || null;
 }
+
 function push(url, dev, urgent = false) {
   db.query("INSERT OR REPLACE INTO queue (url, device, enqueued_at, priority) VALUES (?,?,?,?)")
     .run(url, dev, Date.now(), urgent ? 1 : 0);
+}
+
+// NEW: Helper to check if HTML content is valid (not empty/null)
+function isValidHTML(html) {
+  if (!html || typeof html !== 'string') return false;
+  const trimmed = html.trim();
+  if (!trimmed) return false;
+  // Basic check for minimal HTML structure
+  return trimmed.length > 50 && (trimmed.includes('<html') || trimmed.includes('<body') || trimmed.includes('<!DOCTYPE'));
+}
+
+// NEW: Remove invalid cache entry
+function removeFromCache(url, dev) {
+  db.query("DELETE FROM pages WHERE url = ? AND device = ?").run(url, dev);
 }
 
 /* robots.txt sitemap extractor */
@@ -316,10 +333,41 @@ async function render(full, dev, ua) {
 
     try {
       const { html, status } = await render(`https://${r.url}`, r.device, DEFAULT_UA[r.device]);
-      if (status === 404) db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(r.url, r.device, status, Date.now());
-      save(r.url, r.device, html ? await minify(html, MINIFY_OPTS) : null, status || 0);
+      
+      // Handle different scenarios
+      if (status === 404) {
+        // Store 404 errors in errors table
+        db.query("INSERT OR IGNORE INTO errors (url, device, status, first_hit) VALUES (?,?,?,?)").run(r.url, r.device, status, Date.now());
+      } else if (status === 200 && html) {
+        // Try to minify the HTML
+        let minifiedHtml;
+        try {
+          minifiedHtml = await minify(html, MINIFY_OPTS);
+        } catch (minifyError) {
+          console.warn("Minification failed for", r.url, minifyError);
+          minifiedHtml = html; // Fall back to unminified HTML
+        }
+        
+        // FIXED: Only cache if HTML is valid and not empty
+        if (isValidHTML(minifiedHtml)) {
+          save(r.url, r.device, minifiedHtml, status);
+        } else {
+          console.warn("Invalid/empty HTML detected for", r.url, "- not caching, will retry");
+          // Remove any existing invalid cache entry
+          removeFromCache(r.url, r.device);
+          // Requeue for retry (but not as urgent to avoid infinite loops)
+          push(r.url, r.device, false);
+        }
+      } else {
+        // Non-200 status (except 404) - don't cache, but also remove any existing cache
+        console.warn("Non-200 status", status, "for", r.url, "- removing from cache");
+        removeFromCache(r.url, r.device);
+        // Could implement retry logic here with exponential backoff
+      }
     } catch (e) {
       console.error("Render error", r, e);
+      // On render error, remove any existing cache entry and potentially requeue
+      removeFromCache(r.url, r.device);
     }
   }
 })();
@@ -359,7 +407,20 @@ Bun.serve({
       if (pathname === '/admin/domains' && req.method === 'GET') {
         return Response.json(db.query('SELECT domain, active FROM domains').all());
       }
-      if (pathname === '/admin/flush') { db.exec('DELETE FROM pages; DELETE FROM errors;'); return new Response('cache cleared'); }
+      if (pathname === '/admin/flush') { 
+        db.exec('DELETE FROM pages; DELETE FROM errors;'); 
+        return new Response('cache cleared'); 
+      }
+      // NEW: Admin endpoint to clean empty cache entries
+      if (pathname === '/admin/clean-empty') {
+        const emptyEntries = db.query("SELECT url, device FROM pages WHERE html IS NULL OR html = '' OR LENGTH(TRIM(html)) < 50").all();
+        for (const entry of emptyEntries) {
+          removeFromCache(entry.url, entry.device);
+          // Optionally requeue for retry
+          push(entry.url, entry.device, false);
+        }
+        return new Response(`Cleaned ${emptyEntries.length} empty cache entries`);
+      }
       return new Response('Not Found', { status: 404 });
     }
 
@@ -378,17 +439,25 @@ Bun.serve({
       // 1️⃣ Check cache first
       let snap = get(urlKey, device);
       if (snap) {
-        if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device); // soft refresh in background
-        return new Response(snap.html ?? '', {
-          status: snap.status || 200,
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'X-Prerender-Cache': 'HIT'
-          }
-        });
+        // FIXED: Check if cached HTML is valid, if not, treat as cache miss
+        if (!isValidHTML(snap.html)) {
+          console.warn("Invalid HTML in cache for", urlKey, "- removing and retrying");
+          removeFromCache(urlKey, device);
+          snap = null; // Treat as cache miss
+        } else {
+          // Valid cache hit
+          if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device); // soft refresh in background
+          return new Response(snap.html, {
+            status: snap.status || 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8',
+              'X-Prerender-Cache': 'HIT'
+            }
+          });
+        }
       }
 
-      // 2️⃣ Not cached → enqueue with high priority
+      // 2️⃣ Not cached (or invalid cache) → enqueue with high priority
       push(urlKey, device, true);
 
       // 3️⃣ Give worker a window to process (max = PAGE_TIMEOUT + 3 s)
@@ -396,11 +465,11 @@ Bun.serve({
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
-        if (snap) break;
+        if (snap && isValidHTML(snap.html)) break;
       }
 
-      if (snap) {
-        return new Response(snap.html ?? '', {
+      if (snap && isValidHTML(snap.html)) {
+        return new Response(snap.html, {
           status: snap.status || 200,
           headers: {
             'Content-Type': 'text/html; charset=utf-8',
@@ -425,3 +494,5 @@ Bun.serve({
 
 /*──────────── Boot ───────────*/
 for (const { domain } of db.query('SELECT domain FROM domains WHERE active = 1').all()) robots(domain);
+
+console.log(`🚀 Prerender server running on port ${PORT}`);
