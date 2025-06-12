@@ -510,6 +510,27 @@ async function sitemap(url) {
 }
 
 /*──────────────────────── HTTP server ─────────────────────────*/
+/*────────── Response helper with gzip + Cache‑Control ─────────*/
+function htmlResponse(req, html, status = 200, cacheTag = "MISS") {
+  const enc = req.headers.get("accept-encoding") || "";
+  const headers = {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": `public, max-age=${CACHE_MAX_AGE_SEC}, stale-while-revalidate=${CACHE_MAX_AGE_SEC}`,
+    "X-Prerender-Cache": cacheTag,
+    "Vary": "Accept-Encoding",
+  };
+
+  if (enc.includes("br")) {
+    const compressed = zlib.brotliCompressSync(Buffer.from(html));
+    return new Response(compressed, { status, headers: { ...headers, "Content-Encoding": "br" } });
+  }
+  if (enc.includes("gzip")) {
+    const compressed = zlib.gzipSync(Buffer.from(html));
+    return new Response(compressed, { status, headers: { ...headers, "Content-Encoding": "gzip" } });
+  }
+  return new Response(html, { status, headers });
+}
+
 Bun.serve({
   idleTimeout: 35,
   port: PORT,
@@ -557,10 +578,10 @@ Bun.serve({
     }
 
     /* Render endpoint */
-    if (pathname === '/render') {
-      const target = searchParams.get('url'); if (!target) return new Response('Missing url', { status: 400 });
-      const originalUA = req.headers.get('user-agent') || '';
-      const ua      = originalUA + ' prerender';
+    if (pathname === "/render") {
+      const target = searchParams.get("url"); if (!target) return new Response("Missing url", { status: 400 });
+      const originalUA = req.headers.get("user-agent") || "";
+      const ua      = originalUA + " prerender";
       const device  = deviceFromUA(ua);
       const urlKey  = norm(target);
 
@@ -583,13 +604,7 @@ Bun.serve({
         } else {
           // Valid cache hit
           if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device); // soft refresh in background
-          return new Response(snap.html, {
-            status: snap.status || 200,
-            headers: {
-              'Content-Type': 'text/html; charset=utf-8',
-              'X-Prerender-Cache': 'HIT'
-            }
-          });
+          return htmlResponse(req, snap.html, snap.status || 200, 'HIT');
         }
       }
 
@@ -605,22 +620,14 @@ Bun.serve({
       }
 
       if (snap && isValidHTML(snap.html)) {
-        return new Response(snap.html, {
-          status: snap.status || 200,
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'X-Prerender-Cache': 'MISS-WAIT'
-          }
-        });
+        return htmlResponse(req, snap.html, snap.status || 200, 'MISS-WAIT');
       }
 
       // 4️⃣ If still not ready after extended wait, return a generic error
       console.warn(`[RENDER] Timeout waiting for ${urlKey} (${device}) - rendering took too long`);
       return new Response('Service temporarily unavailable', {
         status: 503,
-        headers: {
-          'X-Prerender-Cache': 'TIMEOUT'
-        }
+        headers: { 'X-Prerender-Cache': 'TIMEOUT' }
       });
     }
 
