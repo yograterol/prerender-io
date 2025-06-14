@@ -28,6 +28,9 @@ const PAGE_TIMEOUT  = 25_000;
 const WORKER_COUNT  = 5;  // Number of concurrent workers
 const CLAIM_TIMEOUT = 60_000;  // Job claim timeout (1 minute)
 
+// Control sitemap processing on startup
+const ENABLE_SITEMAP_CRAWL = process.env.ENABLE_SITEMAP_CRAWL !== 'false'; 
+
 const MINIFY_OPTS = {
   collapseWhitespace: true,
   removeComments: true,
@@ -676,7 +679,14 @@ Bun.serve({
 db.exec('DELETE FROM workers WHERE last_heartbeat < ?', Date.now() - 60000);
 
 // Load domains and start robots crawling
-for (const { domain } of db.query('SELECT domain FROM domains WHERE active = 1').all()) robots(domain);
+if (ENABLE_SITEMAP_CRAWL) {
+  console.log('🤖 Starting sitemap crawling for active domains...');
+  for (const { domain } of db.query('SELECT domain FROM domains WHERE active = 1').all()) {
+    robots(domain);
+  }
+} else {
+  console.log('⏸️  Sitemap crawling disabled via ENABLE_SITEMAP_CRAWL environment variable');
+}
 
 console.log(`🚀 Prerender server running on port ${PORT} with ${WORKER_COUNT} workers`);
 
