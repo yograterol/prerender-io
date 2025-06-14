@@ -489,24 +489,67 @@ async function robots(host) {
 }
 async function sitemap(url) {
   try {
-    const res = await fetch(url); if (!res.ok) return;
+    console.log(`📋 Processing sitemap: ${url}`);
+    const res = await fetch(url); 
+    if (!res.ok) return 0;
+    
     let buf = Buffer.from(await res.arrayBuffer());
     if (url.endsWith('.gz')) buf = zlib.gunzipSync(buf);
     const xml = new XMLParser({ ignoreAttributes: false }).parse(buf.toString());
-    const ins = db.query("INSERT OR IGNORE INTO queue (url, device, enqueued_at, priority, claimed_by, claimed_at) VALUES (?,?,?,0,NULL,NULL)");
     
-    // Queue for all device types
+    let urlsToProcess = [];
+    
+    if (xml.urlset?.url) {
+      urlsToProcess = xml.urlset.url.map(u => norm(u.loc));
+    }
+    
+    if (urlsToProcess.length === 0) {
+      if (xml.sitemapindex?.sitemap) {
+        let totalProcessed = 0;
+        for (const s of xml.sitemapindex.sitemap) {
+          totalProcessed += await sitemapSuperEfficient(s.loc) || 0;
+        }
+        return totalProcessed;
+      }
+      return 0;
+    }
+    
+    // Super efficient: Use a single query to insert only new URLs
     const devices = ['desktop', 'mobile'];
-    const p = u => {
-      const normalizedUrl = norm(u);
-      devices.forEach(device => {
-        ins.run(normalizedUrl, device, Date.now());
-      });
-    };
+    const insertNewUrls = db.query(`
+      INSERT INTO queue (url, device, enqueued_at, priority, claimed_by, claimed_at) 
+      SELECT ?, ?, ?, 0, NULL, NULL
+      WHERE NOT EXISTS (
+        SELECT 1 FROM queue WHERE url = ? AND device = ?
+      ) AND NOT EXISTS (
+        SELECT 1 FROM pages WHERE url = ? AND device = ?
+      )
+    `);
     
-    if (xml.urlset?.url) xml.urlset.url.forEach(u => p(u.loc));
-    if (xml.sitemapindex?.sitemap) for (const s of xml.sitemapindex.sitemap) await sitemap(s.loc);
-  } catch {}
+    let insertCount = 0;
+    const now = Date.now();
+    
+    for (const url of urlsToProcess) {
+      for (const device of devices) {
+        const result = insertNewUrls.run(url, device, now, url, device, url, device);
+        insertCount += result.changes;
+      }
+    }
+    
+    // Handle nested sitemaps
+    if (xml.sitemapindex?.sitemap) {
+      for (const s of xml.sitemapindex.sitemap) {
+        await sitemapSuperEfficient(s.loc);
+      }
+    }
+    
+    console.log(`📋 Sitemap ${url} processed: ${insertCount} new URLs queued`);
+    return insertCount;
+    
+  } catch (e) {
+    console.error(`❌ Error processing sitemap ${url}:`, e);
+    return 0;
+  }
 }
 
 /*──────────────────────── HTTP server ─────────────────────────*/
