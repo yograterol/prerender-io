@@ -473,6 +473,11 @@ async function createWorker(workerId) {
           continue;
         }
 
+        if (snap && Date.now() - snap.fetched_at < REFRESH_MS) {
+          completeJob(workerId, job.url, job.device);
+          continue;
+        }
+
         try {
           const { html, status } = await render(browser, `https://${job.url}`, job.device, DEFAULT_UA[job.device]);
           
@@ -682,6 +687,12 @@ Bun.serve({
 
       /* ───────── cache hit ───────── */
       if (snap) {
+        const isStale = snap && (Date.now() - snap.fetched_at > REFRESH_MS);
+
+        if (isStale) {
+          push(urlKey, device, false);  // Requeue for background refresh
+        }
+
         // 3a. If we still hold an old uncompressed row & client wants gzip → migrate now
         if (!snap.compressed && acceptGzip) {
           const gz = zlib.gzipSync(Buffer.from(snap.html, "utf8"));
