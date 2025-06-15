@@ -181,7 +181,10 @@ function save(url: string, dev: string, html: string, status = 200) {
 }
 
 function get(url, dev) {
-  return db.query("SELECT html, status, fetched_at, compressed FROM pages WHERE url = ? AND device = ?").get(url, dev) || null;
+  return db.query(`
+      SELECT html, status, fetched_at, compressed
+      FROM pages WHERE url = ? AND device = ?
+  `).get(url, dev) || null;
 }
 
 function push(url, dev, urgent = false) {
@@ -190,16 +193,21 @@ function push(url, dev, urgent = false) {
 }
 
 // Helper to check if HTML content is valid (not empty/null)
-function isValidHTML(bufOrStr: Buffer | string) {
-  const html = Buffer.isBuffer(bufOrStr)
-    ? zlib.gunzipSync(bufOrStr).toString("utf8")
-    : bufOrStr;
-    
-  if (!html || typeof html !== 'string') return false;
-  const trimmed = html.trim();
-  if (!trimmed) return false;
-  // Basic check for minimal HTML structure
-  return trimmed.length > 50 && (trimmed.includes('<html') || trimmed.includes('<body') || trimmed.includes('<!DOCTYPE'));
+function isValidHTML(data) {
+  let str: string;
+
+  if (Buffer.isBuffer(data)) {
+    try { str = zlib.gunzipSync(data).toString("utf8"); }
+    catch { return false; /* corrupt gzip */ }
+  } else if (typeof data === "string") {
+    str = data;
+  } else {
+    return false;
+  }
+
+  const trimmed = str.trim();
+  if (trimmed.length < 50) return false;
+  return /<(html|body)[\s>]/i.test(trimmed);
 }
 
 // Remove invalid cache entry
@@ -694,14 +702,13 @@ Bun.serve({
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
-        if (snap && isValidHTML(snap.html)) break;
+        if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
       }
 
       if (snap && isValidHTML(snap.html)) {
-        // ───────── same logic as the cache-hit branch ─────────
         if (acceptGzip && snap.compressed) {
-          return new Response(snap.html, {
-            status: snap.status || 200,
+          return new Response(snap.html, {           // Buffer
+            status: snap.status ?? 200,
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Content-Encoding": "gzip",
@@ -713,7 +720,7 @@ Bun.serve({
         if (snap.compressed && !acceptGzip) {
           const plain = zlib.gunzipSync(snap.html).toString("utf8");
           return new Response(plain, {
-            status: snap.status || 200,
+            status: snap.status ?? 200,
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "X-Prerender-Cache": "MISS-WAIT"
@@ -721,9 +728,9 @@ Bun.serve({
           });
         }
 
-        // snap is still plain-text (fresh page just rendered)
+        // brand-new page saved uncompressed (first ever visit, no gzip Accept)
         return new Response(snap.html, {
-          status: snap.status || 200,
+          status: snap.status ?? 200,
           headers: {
             "Content-Type": "text/html; charset=utf-8",
             "X-Prerender-Cache": "MISS-WAIT"
