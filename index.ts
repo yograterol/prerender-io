@@ -689,7 +689,7 @@ Bun.serve({
       // 2️⃣ Not cached (or invalid cache) → enqueue with high priority
       push(urlKey, device, true);
 
-      // 3️⃣ Give workers a window to process (max = PAGE_TIMEOUT + 10 s)
+      // 3️⃣ Wait for the worker to finish (max = PAGE_TIMEOUT + 10 s)
       const DEADLINE = Date.now() + PAGE_TIMEOUT + 10_000;
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
@@ -698,14 +698,39 @@ Bun.serve({
       }
 
       if (snap && isValidHTML(snap.html)) {
+        // ───────── same logic as the cache-hit branch ─────────
+        if (acceptGzip && snap.compressed) {
+          return new Response(snap.html, {
+            status: snap.status || 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Content-Encoding": "gzip",
+              "X-Prerender-Cache": "MISS-WAIT"
+            }
+          });
+        }
+
+        if (snap.compressed && !acceptGzip) {
+          const plain = zlib.gunzipSync(snap.html).toString("utf8");
+          return new Response(plain, {
+            status: snap.status || 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "X-Prerender-Cache": "MISS-WAIT"
+            }
+          });
+        }
+
+        // snap is still plain-text (fresh page just rendered)
         return new Response(snap.html, {
           status: snap.status || 200,
           headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'X-Prerender-Cache': 'MISS-WAIT'
+            "Content-Type": "text/html; charset=utf-8",
+            "X-Prerender-Cache": "MISS-WAIT"
           }
         });
       }
+
 
       // 4️⃣ If still not ready after extended wait, return a generic error
       console.warn(`[RENDER] Timeout waiting for ${urlKey} (${device}) - rendering took too long`);
