@@ -702,6 +702,7 @@ Bun.serve({
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
+        console.log(`[RENDER] Waiting for ${urlKey} (${device}) - current status: ${snap ? snap.status : 'not cached'}`);
         if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
       }
 
