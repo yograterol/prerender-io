@@ -93,7 +93,7 @@ db.exec(`
   PRAGMA busy_timeout = 5000;
   PRAGMA foreign_keys = ON;
   PRAGMA auto_vacuum = INCREMENTAL;
-  PRAGMA wal_autocheckpoint = 10000;
+  PRAGMA wal_autocheckpoint = 5000;
   PRAGMA optimize = 0x02;
   PRAGMA analysis_limit = 1000;
 `);
