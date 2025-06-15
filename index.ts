@@ -702,6 +702,9 @@ Bun.serve({
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
+        console.log("polled:", snap && { len: snap?.html?.length, compressed: snap?.compressed });
+        console.log("isValidHTML:", isValidHTML(snap.html));
+
         if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
       }
 
