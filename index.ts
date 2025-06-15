@@ -721,9 +721,9 @@ Bun.serve({
       // 3️⃣ Wait for the worker to finish (max = PAGE_TIMEOUT + 10 s)
       const DEADLINE = Date.now() + PAGE_TIMEOUT + 10_000;
       while (Date.now() < DEADLINE) {
-        await Bun.sleep(250);
+        await Bun.sleep(100); // Wait 100 ms
         snap = get(urlKey, device);
-        if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
+        if (snap) break;   // <-- now works for both Buffer & string
       }
 
       console.log(`[RENDER] ${new Date().toISOString()} | Waiting for ${urlKey} (${device}) - ${snap ? 'found' : 'not found'} after wait`);
