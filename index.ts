@@ -190,7 +190,11 @@ function push(url, dev, urgent = false) {
 }
 
 // Helper to check if HTML content is valid (not empty/null)
-function isValidHTML(html) {
+function isValidHTML(bufOrStr: Buffer | string) {
+  const html = Buffer.isBuffer(bufOrStr)
+    ? zlib.gunzipSync(bufOrStr).toString("utf8")
+    : bufOrStr;
+    
   if (!html || typeof html !== 'string') return false;
   const trimmed = html.trim();
   if (!trimmed) return false;
