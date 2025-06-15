@@ -392,9 +392,7 @@ async function render(browser, full, dev, ua) {
           const h = el.getAttribute('href') || el.getAttribute('xlink:href'); if (h) el.setAttribute('href', abs(h));
         }
       });
-    });
 
-    await page.evaluate(() => {
       document.querySelectorAll('img:not([width]):not([height])').forEach(img => {
         if (img.naturalWidth > 1 && img.naturalHeight > 1) {
           img.setAttribute('width', img.naturalWidth);
