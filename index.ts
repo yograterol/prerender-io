@@ -173,11 +173,19 @@ function allowed(host) {
 
 function save(url: string, dev: string, html: string, status = 200) {
   const gz = zlib.gzipSync(Buffer.from(html, "utf8"));   // <-- ~2–5 ms for normal pages
-  db.query(`
-    INSERT OR REPLACE INTO pages
-      (url, device, html, status, fetched_at, compressed)
-    VALUES (?,?,?,?,?,1)
-  `).run(url, dev, gz, status, Date.now());
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.query(`
+      INSERT OR REPLACE INTO pages
+        (url, device, html, status, fetched_at, compressed)
+      VALUES (?,?,?,?,?,1)
+    `).run(url, dev, gz, status, Date.now());
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    console.error(`❌ Error saving page ${url} for device ${dev}:`, e);
+    throw e;
+  }
 }
 
 function get(url, dev) {
@@ -422,6 +430,19 @@ async function render(browser, full, dev, ua) {
 async function createWorker(workerId) {
   registerWorker(workerId);
   const browser = await createBrowser();
+
+  // Add browser warmup - prevents first URL failures
+  try {
+    console.log(`🔧 Worker ${workerId} warming up browser...`);
+    const warmupPage = await browser.newPage();
+    await warmupPage.setUserAgent(DEFAULT_UA.desktop);
+    await warmupPage.setViewport(VIEWPORT.desktop);
+    await warmupPage.goto('data:text/html,<html><body>warmup</body></html>', { waitUntil: 'networkidle0' });
+    await warmupPage.close();
+    console.log(`🔧 Worker ${workerId} browser ready`);
+  } catch (e) {
+    console.warn(`⚠️  Worker ${workerId} warmup failed:`, e);
+  }
   
   console.log(`🔧 Worker ${workerId} started with dedicated browser`);
 
@@ -702,7 +723,6 @@ Bun.serve({
       while (Date.now() < DEADLINE) {
         await Bun.sleep(250);
         snap = get(urlKey, device);
-        console.log(`[RENDER] Waiting for ${urlKey} (${device}) - current status: ${snap ? snap.status : 'not cached'}`);
         if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
       }
 
