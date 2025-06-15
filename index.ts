@@ -146,11 +146,17 @@ CREATE INDEX IF NOT EXISTS idx_queue_claimed      ON queue(claimed_by, claimed_a
 CREATE INDEX IF NOT EXISTS idx_errors_first_hit   ON errors(first_hit);
 CREATE INDEX IF NOT EXISTS idx_domains_active     ON domains(active);
 CREATE INDEX IF NOT EXISTS idx_workers_heartbeat  ON workers(last_heartbeat);
-
-ALTER TABLE pages ADD COLUMN IF NOT EXISTS compressed INTEGER NOT NULL DEFAULT 0;
--- 0 = html column is UTF-8 text (old rows)
--- 1 = html column is already gzip-compressed (Buffer/Blob)
 `);
+
+function ensureCompressedColumn() {
+  const cols = db.query("PRAGMA table_info(pages)").all();
+  const already = cols.some(c => c.name === "compressed");
+  if (!already) {
+    db.exec(`ALTER TABLE pages ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0;`);
+  }
+}
+
+ensureCompressedColumn();
 
 /*────────────────────────── Helpers ───────────────────────────*/
 function norm(raw) {
