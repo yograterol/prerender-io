@@ -665,10 +665,16 @@ Bun.serve({
           });
         } else if (!acceptGzip && snap.compressed) {
           const plain = zlib.gunzipSync(snap.html).toString("utf8");
-          return new Response(plain, { status: snap.status, headers: { … } });
+          return new Response(plain, { status: snap.status, headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "X-Prerender-Cache": "HIT"
+          }});
         } else {
           /* old plain row, client didn’t want gzip */
-          return new Response(snap.html, { status: snap.status, headers: { … } });
+          return new Response(snap.html, { status: snap.status, headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "X-Prerender-Cache": "HIT"
+          }});
         }
       }
 
