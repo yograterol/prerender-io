@@ -18,6 +18,7 @@ import { Database } from "bun:sqlite";
 import puppeteer from "puppeteer";
 import { minify } from "html-minifier-terser";
 import * as zlib from "zlib";
+import { gzipSync } from "zlib";
 import { XMLParser } from "fast-xml-parser";
 
 /*──────────────────────────── Config ───────────────────────────*/
@@ -145,6 +146,10 @@ CREATE INDEX IF NOT EXISTS idx_queue_claimed      ON queue(claimed_by, claimed_a
 CREATE INDEX IF NOT EXISTS idx_errors_first_hit   ON errors(first_hit);
 CREATE INDEX IF NOT EXISTS idx_domains_active     ON domains(active);
 CREATE INDEX IF NOT EXISTS idx_workers_heartbeat  ON workers(last_heartbeat);
+
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS compressed INTEGER NOT NULL DEFAULT 0;
+-- 0 = html column is UTF-8 text (old rows)
+-- 1 = html column is already gzip-compressed (Buffer/Blob)
 `);
 
 /*────────────────────────── Helpers ───────────────────────────*/
@@ -160,13 +165,17 @@ function allowed(host) {
   return !!r?.active;
 }
 
-function save(url, dev, html, status = 200) {
-  db.query("INSERT OR REPLACE INTO pages (url, device, html, status, fetched_at) VALUES (?,?,?,?,?)")
-    .run(url, dev, html, status, Date.now());
+function save(url: string, dev: string, html: string, status = 200) {
+  const gz = zlib.gzipSync(Buffer.from(html, "utf8"));   // <-- ~2–5 ms for normal pages
+  db.query(`
+    INSERT OR REPLACE INTO pages
+      (url, device, html, status, fetched_at, compressed)
+    VALUES (?,?,?,?,?,1)
+  `).run(url, dev, gz, status, Date.now());
 }
 
 function get(url, dev) {
-  return db.query("SELECT html, status, fetched_at FROM pages WHERE url = ? AND device = ?").get(url, dev) || null;
+  return db.query("SELECT html, status, fetched_at, compressed FROM pages WHERE url = ? AND device = ?").get(url, dev) || null;
 }
 
 function push(url, dev, urgent = false) {
@@ -371,6 +380,15 @@ async function render(browser, full, dev, ua) {
         if (el instanceof HTMLImageElement) el.src = abs(el.getAttribute('src') || '');
         else if (el.tagName === 'image' || el.tagName === 'use') {
           const h = el.getAttribute('href') || el.getAttribute('xlink:href'); if (h) el.setAttribute('href', abs(h));
+        }
+      });
+    });
+
+    await page.evaluate(() => {
+      document.querySelectorAll('img:not([width]):not([height])').forEach(img => {
+        if (img.naturalWidth > 1 && img.naturalHeight > 1) {
+          img.setAttribute('width', img.naturalWidth);
+          img.setAttribute('height', img.naturalHeight);
         }
       });
     });
@@ -619,23 +637,38 @@ Bun.serve({
       if (err) return new Response('Not found', { status: err.status, headers: { 'X-Prerender-Cache': '404' }});
 
       // 1️⃣ Check cache first
-      let snap = get(urlKey, device);
+      const acceptGzip = (req.headers.get("accept-encoding") || "")
+                     .toLowerCase()
+                     .includes("gzip");
+
+      let snap = get(urlKey, device);   // now returns {html, status, fetched_at, compressed}
+
+      /* ───────── cache hit ───────── */
       if (snap) {
-        // Check if cached HTML is valid, if not, treat as cache miss
-        if (!isValidHTML(snap.html)) {
-          console.warn("Invalid HTML in cache for", urlKey, "- removing and retrying");
-          removeFromCache(urlKey, device);
-          snap = null; // Treat as cache miss
-        } else {
-          // Valid cache hit
-          if (Date.now() - snap.fetched_at > REFRESH_MS) push(urlKey, device); // soft refresh in background
-          return new Response(snap.html, {
-            status: snap.status || 200,
+        // 3a. If we still hold an old uncompressed row & client wants gzip → migrate now
+        if (!snap.compressed && acceptGzip) {
+          const gz = zlib.gzipSync(Buffer.from(snap.html, "utf8"));
+          db.query("UPDATE pages SET html = ?, compressed = 1 WHERE url = ? AND device = ?")
+            .run(gz, urlKey, device);
+          snap = { ...snap, html: gz, compressed: 1 };
+        }
+
+        // 3b. Serve in whatever shape the client asked for
+        if (acceptGzip && snap.compressed) {
+          return new Response(snap.html, {                 // Buffer
+            status: snap.status,
             headers: {
-              'Content-Type': 'text/html; charset=utf-8',
-              'X-Prerender-Cache': 'HIT'
+              "Content-Type": "text/html; charset=utf-8",
+              "Content-Encoding": "gzip",
+              "X-Prerender-Cache": "HIT"
             }
           });
+        } else if (!acceptGzip && snap.compressed) {
+          const plain = zlib.gunzipSync(snap.html).toString("utf8");
+          return new Response(plain, { status: snap.status, headers: { … } });
+        } else {
+          /* old plain row, client didn’t want gzip */
+          return new Response(snap.html, { status: snap.status, headers: { … } });
         }
       }
 
