@@ -726,6 +726,8 @@ Bun.serve({
         if (snap && isValidHTML(snap.html)) break;   // <-- now works for both Buffer & string
       }
 
+      console.log(`[RENDER] ${new Date().toISOString()} | Waiting for ${urlKey} (${device}) - ${snap ? 'found' : 'not found'} after wait`);
+
       if (snap && isValidHTML(snap.html)) {
         if (acceptGzip && snap.compressed) {
           return new Response(snap.html, {           // Buffer
