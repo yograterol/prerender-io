@@ -336,7 +336,7 @@ async function render(browser, full, dev, ua) {
   await page.setUserAgent(ua || DEFAULT_UA[dev]);
   await page.setViewport(VIEWPORT[dev]);
 
-  const FONT_OK = [host, `fonts.gstatic.com`, `cdnjs.cloudflare.com`,]; // Removed  `cdn.materialdesignicons.com`
+  const FONT_OK = [host, `fonts.gstatic.com`]; // Removed  `cdn.materialdesignicons.com`, `cdnjs.cloudflare.com`
 
   /*──── Request interception ────*/
   await page.setRequestInterception(true);
