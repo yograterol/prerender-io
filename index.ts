@@ -463,6 +463,7 @@ async function createWorker(workerId) {
         console.log(`🔧 Worker ${workerId} processing: ${job.url} (${job.device})`);
 
         if (!allowed(job.url.split('/')[0])) {
+          console.warn(`🔧 Worker ${workerId} skipping ${job.url} (${job.device}) - domain not allowed`);
           completeJob(workerId, job.url, job.device);
           continue;
         }
@@ -470,6 +471,7 @@ async function createWorker(workerId) {
         const snap = get(job.url, job.device);
 
         if (snap && Date.now() - snap.fetched_at < REFRESH_MS) {
+          console.log(`🔧 Worker ${workerId} skipping ${job.url} (${job.device}) - already cached`);
           completeJob(workerId, job.url, job.device);
           continue;
         }
