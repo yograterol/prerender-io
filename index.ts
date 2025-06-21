@@ -473,11 +473,6 @@ async function createWorker(workerId) {
           continue;
         }
 
-        if (snap && Date.now() - snap.fetched_at < REFRESH_MS) {
-          completeJob(workerId, job.url, job.device);
-          continue;
-        }
-
         try {
           const { html, status } = await render(browser, `https://${job.url}`, job.device, DEFAULT_UA[job.device]);
           
