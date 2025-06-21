@@ -223,6 +223,18 @@ function removeFromCache(url, dev) {
   db.query("DELETE FROM pages WHERE url = ? AND device = ?").run(url, dev);
 }
 
+// Helper to check if URL has a file extension
+function hasExtension(url) {
+  try {
+    const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
+    const pathname = urlObj.pathname;
+    const lastSegment = pathname.split('/').pop() || '';
+    return lastSegment.includes('.') && !lastSegment.endsWith('.');
+  } catch {
+    return false;
+  }
+}
+
 // Worker management functions
 function registerWorker(workerId) {
   const now = Date.now();
@@ -668,8 +680,12 @@ Bun.serve({
       const device  = deviceFromUA(ua);
       const urlKey  = norm(target);
 
-      // Log the user agent information
-      console.log(`[RENDER] ${new Date().toISOString()} | URL: ${target} | User-Agent: "${originalUA}" | Device: ${device}`);
+      // Only log [RENDER] if URL doesn't have an extension
+      const shouldLog = !hasExtension(target);
+
+      if (shouldLog) {
+        console.log(`[RENDER] ${new Date().toISOString()} | URL: ${target} | User-Agent: "${originalUA}" | Device: ${device}`);
+      }
 
       if (!allowed(urlKey.split('/')[0])) return new Response('Domain not allowed', { status: 403 });
 
@@ -716,7 +732,7 @@ Bun.serve({
             "X-Prerender-Cache": "HIT"
           }});
         } else {
-          /* old plain row, client didn’t want gzip */
+          /* old plain row, client didn't want gzip */
           return new Response(snap.html, { status: snap.status, headers: {
             "Content-Type": "text/html; charset=utf-8",
             "X-Prerender-Cache": "HIT"
@@ -735,7 +751,9 @@ Bun.serve({
         if (snap) break;   // <-- now works for both Buffer & string
       }
 
-      console.log(`[RENDER] ${new Date().toISOString()} | Waiting for ${urlKey} (${device}) - ${snap ? 'found' : 'not found'} after wait`);
+      if (shouldLog) {
+        console.log(`[RENDER] ${new Date().toISOString()} | Waiting for ${urlKey} (${device}) - ${snap ? 'found' : 'not found'} after wait`);
+      }
 
       if (snap) {
         if (acceptGzip && snap.compressed) {
