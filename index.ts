@@ -468,7 +468,8 @@ async function createWorker(workerId) {
         }
 
         const snap = get(job.url, job.device);
-        if (snap && Date.now() - snap.fetched_at < PURGE_MS) {
+
+        if (snap && Date.now() - snap.fetched_at < REFRESH_MS) {
           completeJob(workerId, job.url, job.device);
           continue;
         }
