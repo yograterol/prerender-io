@@ -717,6 +717,7 @@ Bun.serve({
 
         // 3b. Serve in whatever shape the client asked for
         if (acceptGzip && snap.compressed) {
+          console.log(`[RENDER] ${new Date().toISOString()} | Serving compressed HTML for ${urlKey} (${device})`);
           return new Response(snap.html, {                 // Buffer
             status: snap.status,
             headers: {
@@ -727,12 +728,14 @@ Bun.serve({
           });
         } else if (!acceptGzip && snap.compressed) {
           const plain = zlib.gunzipSync(snap.html).toString("utf8");
+          console.log(`[RENDER] ${new Date().toISOString()} | Serving uncompressed HTML for ${urlKey} (${device})`);
           return new Response(plain, { status: snap.status, headers: {
             "Content-Type": "text/html; charset=utf-8",
             "X-Prerender-Cache": "HIT"
           }});
         } else {
           /* old plain row, client didn't want gzip */
+          console.log(`[RENDER] ${new Date().toISOString()} | Serving uncompressed HTML for ${urlKey} (${device})`);
           return new Response(snap.html, { status: snap.status, headers: {
             "Content-Type": "text/html; charset=utf-8",
             "X-Prerender-Cache": "HIT"
@@ -757,6 +760,7 @@ Bun.serve({
 
       if (snap) {
         if (acceptGzip && snap.compressed) {
+          console.log(`[RENDER] ${new Date().toISOString()} | Serving compressed HTML for ${urlKey} (${device}) after wait`);
           return new Response(snap.html, {           // Buffer
             status: snap.status ?? 200,
             headers: {
@@ -769,6 +773,7 @@ Bun.serve({
 
         if (snap.compressed && !acceptGzip) {
           const plain = zlib.gunzipSync(snap.html).toString("utf8");
+          console.log(`[RENDER] ${new Date().toISOString()} | Serving uncompressed HTML for ${urlKey} (${device}) after wait`);
           return new Response(plain, {
             status: snap.status ?? 200,
             headers: {
@@ -778,6 +783,7 @@ Bun.serve({
           });
         }
 
+        console.log(`[RENDER] ${new Date().toISOString()} | Serving uncompressed HTML for ${urlKey} (${device}) after wait`);
         // brand-new page saved uncompressed (first ever visit, no gzip Accept)
         return new Response(snap.html, {
           status: snap.status ?? 200,
